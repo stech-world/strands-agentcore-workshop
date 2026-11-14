@@ -1,0 +1,44 @@
+[project]
+name = "strands-agentcore-workshop"
+version = "0.1.0"
+description = "End-to-end customer support agent built with Strands Agents and Amazon Bedrock AgentCore"
+readme = "README.md"
+requires-python = ">=3.10"
+# Agent dependencies. These are also exported to requirements.txt, which
+# AgentCore Runtime uses to build the agent container in Lab 4.
+dependencies = [
+    "strands-agents",
+    "strands-agents-tools<0.9",  # 0.9 removed the `retrieve` tool used in Lab 1
+    "boto3>=1.42.3",
+    "botocore>=1.42.3",
+    "bedrock-agentcore==1.1.1",
+    "bedrock-agentcore-starter-toolkit==0.2.3",
+    "aws-opentelemetry-distro==0.14.0",
+    "ddgs",
+    "pyyaml",
+    "requests",
+]
+
+[dependency-groups]
+# Local tooling to run the lab notebooks (not shipped to AgentCore Runtime).
+notebooks = [
+    "jupyterlab",
+    "ipykernel",
+]
+# Lab 6: Streamlit customer frontend.
+frontend = [
+    "streamlit",
+    "streamlit-cognito-auth",
+]
+# Optional labs: Identity (Google Calendar) and Observability deep dives.
+optional-labs = [
+    "python-dotenv",
+    "google-auth",
+    "google-api-python-client",
+]
+
+[tool.uv]
+# The labs are notebooks, not an installable package.
+package = false
+# `uv sync` installs everything needed for all labs by default.
+default-groups = ["notebooks", "frontend", "optional-labs"]

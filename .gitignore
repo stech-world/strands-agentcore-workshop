@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build / deploy artifacts
+*.zip
+build/
+.bedrock_agentcore/
+.bedrock_agentcore.yaml
+Dockerfile
+.dockerignore
+
+# OS / editor
+.DS_Store
