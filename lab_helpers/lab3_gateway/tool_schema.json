@@ -1,15 +1,17 @@
 [
     {
         "name": "check_warranty_status",
-        "description": "Check the warranty status of a product using its serial number and optionally verify via email",
+        "description": "Check the warranty status of a product using its serial number and optionally verify the customer email",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "serial_number": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "The product serial number"
                 },
                 "customer_email": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Optional customer email to verify ownership"
                 }
             },
             "required": [
@@ -19,17 +21,13 @@
     },
     {
         "name": "web_search",
-        "description": "Search the web for updated information using DuckDuckGo",
+        "description": "Search the web for updated information",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "keywords": {
                     "type": "string",
                     "description": "The search query keywords"
-                },
-                "region": {
-                    "type": "string",
-                    "description": "The search region (e.g., us-en, uk-en, ru-ru)"
                 },
                 "max_results": {
                     "type": "integer",

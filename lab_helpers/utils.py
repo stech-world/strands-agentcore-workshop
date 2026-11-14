@@ -1,9 +1,12 @@
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import time
+import zipfile
+from pathlib import Path
 from typing import Any, Dict
 
 import boto3
@@ -21,6 +24,18 @@ sm_name = "customer_support_agent"
 
 role_name = f"CustomerSupportAssistantBedrockAgentCoreRole-{REGION}"
 policy_name = f"CustomerSupportAssistantBedrockAgentCorePolicy-{REGION}"
+
+# Lab 1: Amazon Bedrock Knowledge Base used by the technical support tool
+KB_DOCS_DIR = Path(__file__).parent / "lab1_knowledge_base"
+KB_EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
+KB_EMBEDDING_DIMENSIONS = 1024
+
+# Lab 3: AgentCore Gateway tools (AWS Lambda) and IAM roles
+GATEWAY_LAMBDA_NAME = "customersupport-gateway-tools"
+GATEWAY_LAMBDA_ROLE_NAME = f"CustomerSupportGatewayLambdaRole-{REGION}"
+GATEWAY_ROLE_NAME = f"CustomerSupportGatewayRole-{REGION}"
+GATEWAY_LAMBDA_SOURCE = Path(__file__).parent / "lab3_gateway" / "lambda_function.py"
+GATEWAY_TOOL_SCHEMA = Path(__file__).parent / "lab3_gateway" / "tool_schema.json"
 
 
 def get_ssm_parameter(name: str, with_decryption: bool = True) -> str:
@@ -204,13 +219,13 @@ def get_or_create_cognito_pool(refresh_token=False):
     try:
         # Create User Pool
         user_pool_response = cognito_client.create_user_pool(
-            PoolName="MCPServerPool", Policies={"PasswordPolicy": {"MinimumLength": 8}}
+            PoolName="customersupport-user-pool", Policies={"PasswordPolicy": {"MinimumLength": 8}}
         )
         pool_id = user_pool_response["UserPool"]["Id"]
         # Create App Client
         app_client_response = cognito_client.create_user_pool_client(
             UserPoolId=pool_id,
-            ClientName="MCPServerPoolClient",
+            ClientName="customersupport-client",
             GenerateSecret=True,
             ExplicitAuthFlows=[
                 "ALLOW_USER_PASSWORD_AUTH",
@@ -271,7 +286,6 @@ def get_or_create_cognito_pool(refresh_token=False):
         put_ssm_parameter("/app/customersupport/agentcore/client_id", client_id)
         put_ssm_parameter("/app/customersupport/agentcore/pool_id", pool_id)
         put_ssm_parameter("/app/customersupport/agentcore/cognito_discovery_url", discovery_url)
-        put_ssm_parameter("/app/customersupport/agentcore/client_secret", client_secret)
 
         save_customer_support_secret(json.dumps(cognito_config))
 
@@ -577,199 +591,163 @@ def delete_agentcore_runtime_execution_role():
         print(f"❌ Error during cleanup: {str(e)}")
 
 
-def agentcore_memory_cleanup(memory_id: str = None):
-    """List all memories and their associated strategies"""
-    control_client = boto3.client("bedrock-agentcore-control", region_name=REGION)
-    if memory_id:
-        response = control_client.delete_memory(memoryId=memory_id)
-        print(f"✅ Successfully deleted memory: {memory_id}")
-    else:
-        next_token = None
-        while True:
-            # Build request parameters
-            params = {}
-            if next_token:
-                params["nextToken"] = next_token
+# ---------------------------------------------------------------------------
+# Lab 3: AWS resources for AgentCore Gateway
+# ---------------------------------------------------------------------------
 
-            # List memories
+
+def _get_or_create_role(role_name: str, trust_policy: dict, description: str) -> tuple[str, bool]:
+    """Return (role ARN, created) for an IAM role, creating it if it doesn't exist."""
+    iam = boto3.client("iam")
+    try:
+        return iam.get_role(RoleName=role_name)["Role"]["Arn"], False
+    except iam.exceptions.NoSuchEntityException:
+        pass
+    role = iam.create_role(
+        RoleName=role_name,
+        AssumeRolePolicyDocument=json.dumps(trust_policy),
+        Description=description,
+    )
+    print(f"✅ Created IAM role: {role_name}")
+    return role["Role"]["Arn"], True
+
+
+def create_gateway_tools_lambda() -> str:
+    """Create (or update) the Lambda function that implements the Gateway tools.
+
+    The function code is the single file lab_helpers/lab3_gateway/lambda_function.py,
+    zipped in memory. Returns the function ARN, also stored in SSM.
+    """
+    iam = boto3.client("iam")
+    lambda_client = boto3.client("lambda", region_name=REGION)
+
+    role_arn, _ = _get_or_create_role(
+        GATEWAY_LAMBDA_ROLE_NAME,
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}
+            ],
+        },
+        "Execution role for the customer support Gateway tools Lambda",
+    )
+    iam.attach_role_policy(
+        RoleName=GATEWAY_LAMBDA_ROLE_NAME,
+        PolicyArn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+    )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(GATEWAY_LAMBDA_SOURCE, arcname="lambda_function.py")
+    code = buffer.getvalue()
+
+    try:
+        function = lambda_client.get_function(FunctionName=GATEWAY_LAMBDA_NAME)["Configuration"]
+        lambda_client.update_function_code(FunctionName=GATEWAY_LAMBDA_NAME, ZipFile=code)
+        print(f"ℹ️ Lambda function {GATEWAY_LAMBDA_NAME} already exists: code updated")
+    except lambda_client.exceptions.ResourceNotFoundException:
+        # A newly created IAM role can take a few seconds before Lambda is able to assume it
+        for attempt in range(10):
             try:
-                response = control_client.list_memories(**params)
-
-                # Process each memory
-                for memory in response.get("memories", []):
-                    memory_id = memory.get("id")
-                    print(f"\nMemory ID: {memory_id}")
-                    print(f"Status: {memory.get('status')}")
-                    response = control_client.delete_memory(memoryId=memory_id)
-                    response = control_client.list_memories(**params)
-                    print(f"✅ Successfully deleted memory: {memory_id}")
-
-                response = control_client.list_memories(**params)
-                # Process each memory status
-                for memory in response.get("memories", []):
-                    memory_id = memory.get("id")
-                    print(f"\nMemory ID: {memory_id}")
-                    print(f"Status: {memory.get('status')}")
-
-            except Exception as e:
-                print(f"⚠️  Error getting memory details: {e}")
-            # Check for more results
-            next_token = response.get("nextToken")
-            if not next_token:
+                function = lambda_client.create_function(
+                    FunctionName=GATEWAY_LAMBDA_NAME,
+                    Runtime="python3.12",
+                    Role=role_arn,
+                    Handler="lambda_function.lambda_handler",
+                    Code={"ZipFile": code},
+                    Description="Mocked customer support tools exposed through AgentCore Gateway",
+                    Timeout=10,
+                )
                 break
+            except lambda_client.exceptions.InvalidParameterValueException as e:
+                if "cannot be assumed" not in str(e) or attempt == 9:
+                    raise
+                print("⏳ Waiting for the IAM role to propagate...")
+                time.sleep(5)
+        print(f"✅ Created Lambda function: {GATEWAY_LAMBDA_NAME}")
+
+    lambda_client.get_waiter("function_active_v2").wait(FunctionName=GATEWAY_LAMBDA_NAME)
+    lambda_client.get_waiter("function_updated_v2").wait(FunctionName=GATEWAY_LAMBDA_NAME)
+    function_arn = function["FunctionArn"]
+    put_ssm_parameter("/app/customersupport/agentcore/lambda_arn", function_arn)
+    return function_arn
 
 
-def gateway_target_cleanup(gateway_id: str = None):
-    gateway_client = boto3.client(
-        "bedrock-agentcore-control",
-        region_name=REGION,
+def create_gateway_role(lambda_arn: str) -> str:
+    """Create (or reuse) the IAM role AgentCore Gateway assumes to invoke the tools Lambda."""
+    iam = boto3.client("iam")
+    account_id = get_aws_account_id()
+
+    role_arn, created = _get_or_create_role(
+        GATEWAY_ROLE_NAME,
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {
+                        "StringEquals": {"aws:SourceAccount": account_id},
+                        "ArnLike": {"aws:SourceArn": f"arn:aws:bedrock-agentcore:{REGION}:{account_id}:*"},
+                    },
+                }
+            ],
+        },
+        "Role assumed by AgentCore Gateway to invoke the customer support tools",
     )
-
-    if not gateway_id:
-        response = gateway_client.list_gateways()
-        gateway_id = response["items"][0]["gatewayId"]
-    print(f"🗑️  Deleting all targets for gateway: {gateway_id}")
-
-    # List and delete all targets
-    list_response = gateway_client.list_gateway_targets(gatewayIdentifier=gateway_id, maxResults=100)
-
-    targets_deleted = False
-    for item in list_response["items"]:
-        target_id = item["targetId"]
-        print(f"   Deleting target: {target_id}")
-        gateway_client.delete_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id)
-        print(f"   ✅ Target {target_id} deleted")
-        targets_deleted = True
-
-    # Wait for target deletions to propagate
-    if targets_deleted:
-        print("⏳ Waiting for target deletions to propagate...")
-        time.sleep(5)
-
-    # Delete the gateway
-    print(f"🗑️  Deleting gateway: {gateway_id}")
-    gateway_client.delete_gateway(gatewayIdentifier=gateway_id)
-    print(f"✅ Gateway {gateway_id} deleted successfully")
-
-
-def runtime_resource_cleanup(runtime_arn: str = None):
-    try:
-        # Initialize AWS clients
-        agentcore_control_client = boto3.client("bedrock-agentcore-control", region_name=REGION)
-        ecr_client = boto3.client("ecr", region_name=REGION)
-        if runtime_arn:
-            runtime_id = runtime_arn.split(":")[-1].split("/")[-1]
-            response = agentcore_control_client.delete_agent_runtime(agentRuntimeId=runtime_id)
-            print(f"  ✅ Agent runtime deleted: {response['status']}")
-        else:
-            # Delete the AgentCore Runtime
-            # print("  🗑️  Deleting AgentCore Runtime...")
-            runtimes = agentcore_control_client.list_agent_runtimes()
-            for runtime in runtimes["agentRuntimes"]:
-                response = agentcore_control_client.delete_agent_runtime(agentRuntimeId=runtime["agentRuntimeId"])
-                print(f"  ✅ Agent runtime deleted: {response['status']}")
-
-        # Delete the ECR repository
-        print("  🗑️  Deleting ECR repository...")
-        repositories = ecr_client.describe_repositories()
-        for repo in repositories["repositories"]:
-            if "bedrock-agentcore-customer_support_agent" in repo["repositoryName"]:
-                ecr_client.delete_repository(repositoryName=repo["repositoryName"], force=True)
-                print(f"  ✅ ECR repository deleted: {repo['repositoryName']}")
-
-    except Exception as e:
-        print(f"  ⚠️  Error during runtime cleanup: {e}")
-
-
-def delete_observability_resources():
-    # Configuration
-    log_group_name = "agents/customer-support-assistant-logs"
-    log_stream_name = "default"
-
-    logs_client = boto3.client("logs", region_name=REGION)
-
-    # Delete log stream first (must be done before deleting log group)
-    try:
-        print(f"  🗑️  Deleting log stream '{log_stream_name}'...")
-        logs_client.delete_log_stream(logGroupName=log_group_name, logStreamName=log_stream_name)
-        print(f"  ✅ Log stream '{log_stream_name}' deleted successfully")
-    except Exception as e:
-        if e.response["Error"]["Code"] == "ResourceNotFoundException":
-            print(f"  ℹ️  Log stream '{log_stream_name}' doesn't exist")
-        else:
-            print(f"  ⚠️  Error deleting log stream: {e}")
-
-    # Delete log group
-    try:
-        print(f"  🗑️  Deleting log group '{log_group_name}'...")
-        logs_client.delete_log_group(logGroupName=log_group_name)
-        print(f"  ✅ Log group '{log_group_name}' deleted successfully")
-    except Exception as e:
-        if e.response["Error"]["Code"] == "ResourceNotFoundException":
-            print(f"  ℹ️  Log group '{log_group_name}' doesn't exist")
-        else:
-            print(f"  ⚠️  Error deleting log group: {e}")
-
-
-def local_file_cleanup():
-    # List of files to clean up
-    files_to_delete = [
-        "Dockerfile",
-        ".dockerignore",
-        ".bedrock_agentcore.yaml",
-        "customer_support_agent.py",
-        "agent_runtime.py",
-    ]
-
-    deleted_files = []
-    missing_files = []
-
-    for file in files_to_delete:
-        if os.path.exists(file):
-            try:
-                os.unlink(file)
-                deleted_files.append(file)
-                print(f"  ✅ Deleted {file}")
-            except Exception as e:
-                print(f"  ⚠️  Error deleting {file}: {e}")
-        else:
-            missing_files.append(file)
-
-    if deleted_files:
-        print(f"\n📁 Successfully deleted {len(deleted_files)} files")
-    if missing_files:
-        print(f"ℹ️  {len(missing_files)} files were already missing: {', '.join(missing_files)}")
-
-
-def policy_engine_cleanup(policy_engine_id: str = None):
-    policy_client = boto3.client(
-        "bedrock-agentcore-control",
-        region_name=REGION,
+    iam.put_role_policy(
+        RoleName=GATEWAY_ROLE_NAME,
+        PolicyName="InvokeGatewayToolsLambda",
+        PolicyDocument=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": lambda_arn}],
+            }
+        ),
     )
+    if created:
+        print("⏳ Waiting 10 seconds for the new IAM role to propagate...")
+        time.sleep(10)
 
-    if not policy_engine_id:
-        response = policy_client.list_policy_engines()
-        policy_engine_id = response["policyEngines"][0]["policyEngineId"]
+    put_ssm_parameter("/app/customersupport/agentcore/gateway_iam_role", role_arn)
+    return role_arn
 
-    print(f"🗑️  Deleting all policies for policy engine: {policy_engine_id}")
 
-    # List and delete all policies
-    list_response = policy_client.list_policies(policyEngineId=policy_engine_id, maxResults=100)
+# ---------------------------------------------------------------------------
+# Optional Identity lab: Cognito domain for the OAuth2 endpoints
+# ---------------------------------------------------------------------------
 
-    policies_deleted = False
-    for item in list_response["policies"]:
-        policy_id = item["policyId"]
-        print(f"   Deleting policy: {policy_id}")
-        policy_client.delete_policy(policyEngineId=policy_engine_id, policyId=policy_id)
-        print(f"   ✅ Policy {policy_id} deleted")
-        policies_deleted = True
 
-    # Wait for policy deletions to propagate before deleting the engine
-    if policies_deleted:
-        print("⏳ Waiting for policy deletions to propagate...")
-        time.sleep(5)  # 5 seconds is usually sufficient
+def get_or_create_cognito_domain(pool_id: str) -> str:
+    """Return the Cognito domain prefix of the user pool, creating one if needed."""
+    cognito = boto3.client("cognito-idp", region_name=REGION)
+    domain = cognito.describe_user_pool(UserPoolId=pool_id)["UserPool"].get("Domain")
+    if domain:
+        return domain
 
-    # Delete the policy engine
-    print(f"🗑️  Deleting policy engine: {policy_engine_id}")
-    policy_client.delete_policy_engine(policyEngineId=policy_engine_id)
-    print(f"✅ Policy engine {policy_engine_id} deleted successfully")
+    domain = f"customersupport-{get_aws_account_id()}-{REGION}"
+    cognito.create_user_pool_domain(Domain=domain, UserPoolId=pool_id)
+    print(f"✅ Created Cognito domain: {domain}")
+    return domain
+
+
+# ---------------------------------------------------------------------------
+# Lab 1: names of the Knowledge Base resources (shared with the Lab 7 cleanup)
+# ---------------------------------------------------------------------------
+
+
+def get_kb_resource_names() -> Dict[str, str]:
+    """Names of the AWS resources backing the Lab 1 Knowledge Base.
+
+    S3 bucket names are global, so they include the account ID and region.
+    """
+    account_id = get_aws_account_id()
+    return {
+        "docs_bucket": f"customersupport-kb-docs-{account_id}-{REGION}",
+        "vector_bucket": f"customersupport-kb-vectors-{account_id}-{REGION}",
+        "vector_index": "customersupport-kb-index",
+        "role": f"CustomerSupportKnowledgeBaseRole-{REGION}",
+        "knowledge_base": "customersupport-kb",
+        "data_source": "customersupport-kb-docs",
+    }

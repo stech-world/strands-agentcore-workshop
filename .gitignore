@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 venv/
 .env
+observability.env
+credentials.json
 *.egg-info/
 
 # Jupyter
@@ -11,11 +13,11 @@ venv/
 
 # Build / deploy artifacts
 *.zip
-build/
 .bedrock_agentcore/
 .bedrock_agentcore.yaml
 Dockerfile
 .dockerignore
+customer_support_agent.py
 
 # OS / editor
 .DS_Store

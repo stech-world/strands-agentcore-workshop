@@ -1,6 +1,0 @@
-# Dependencies packaged into the Lambda layer built by scripts/prereq.sh (via `uv pip install --target`)
-# (target: AWS Lambda, python3.12, x86_64)
-ddgs==9.5.2
-primp==0.15.0
-lxml==6.0.0
-click==8.1.8
