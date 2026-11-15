@@ -29,12 +29,8 @@ googleapis-common-protos==1.75.0
 grpcio==1.85.1
 h11==0.16.0
 httpcore==1.0.9
-httpcore2==2.14.0 ; python_full_version < '3.11' and sys_platform != 'emscripten'
-httpcore2==2.16.0 ; python_full_version >= '3.11' and sys_platform != 'emscripten'
 httpx==0.28.1
-httpx2==2.14.0 ; python_full_version < '3.11'
-httpx2==2.16.0 ; python_full_version >= '3.11'
-httpx2-jsfetch==1.0 ; python_full_version >= '3.12' and sys_platform == 'emscripten'
+httpx-sse==0.4.3
 identify==2.6.20
 idna==3.20
 importlib-metadata==8.6.1
@@ -47,8 +43,7 @@ lazy-object-proxy==1.12.0 ; python_full_version < '3.11'
 lazy-object-proxy==1.13.0 ; python_full_version >= '3.11'
 markdown-it-py==4.3.0
 markupsafe==3.0.4
-mcp==2.3.0
-mcp-types==2.3.0
+mcp==1.30.0
 mdurl==0.1.2
 nodeenv==1.12.0
 openapi-schema-validator==0.9.0
@@ -159,7 +154,6 @@ starlette==1.10.0 ; python_full_version >= '3.11'
 strands-agents==1.65.0
 toml==0.10.2
 tomli==2.5.0 ; python_full_version < '3.11'
-truststore==0.10.5 ; sys_platform != 'emscripten'
 typer==0.29.1
 typing-extensions==4.16.0
 typing-inspection==0.4.5

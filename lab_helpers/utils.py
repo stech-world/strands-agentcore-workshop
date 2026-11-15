@@ -18,7 +18,9 @@ sts_client = boto3.client("sts")
 # Get AWS account details
 REGION = boto3.session.Session().region_name
 
-username = "testuser"
+# Test user of the Cognito user pool, used to get access tokens for the Gateway and the Runtime
+COGNITO_TEST_USERNAME = "testuser"
+COGNITO_TEST_PASSWORD = "MyPassword123!"  # pragma: allowlist secret
 sm_name = "customer_support_agent"
 
 
@@ -180,6 +182,8 @@ def get_customer_support_secret():
     try:
         response = secrets_client.get_secret_value(SecretId=sm_name)
         return response["SecretString"]
+    except secrets_client.exceptions.ResourceNotFoundException:
+        return None  # not created yet
     except Exception as e:
         print(f"Error getting secret: {str(e)}")
         return None
@@ -199,100 +203,88 @@ def delete_customer_support_secret():
         return False
 
 
-def get_or_create_cognito_pool(refresh_token=False):
-    boto_session = Session()
-    region = boto_session.region_name
-    # Initialize Cognito client
-    cognito_client = boto3.client("cognito-idp", region_name=region)
-    try:
-        # check for existing cognito pool
-        cognito_config_str = get_customer_support_secret()
+def get_or_create_cognito_pool():
+    """Return the workshop's Cognito configuration: pool_id, client_id, client_secret and discovery_url.
+
+    The first call creates the user pool, an app client and a test user, then saves the configuration
+    in Secrets Manager (and the IDs in SSM). Later calls only read it: the Gateway and Runtime
+    authorizers trust this pool, so it must not be recreated. Use get_cognito_access_token() to log in.
+    """
+    cognito_config_str = get_customer_support_secret()
+    if cognito_config_str:
         cognito_config = json.loads(cognito_config_str)
-        if refresh_token:
-            cognito_config["bearer_token"] = reauthenticate_user(
-                cognito_config["client_id"], cognito_config["client_secret"]
-            )
-        return cognito_config
-    except Exception:
-        print("No existing cognito config found. Creating a new one..")
+        return {key: cognito_config[key] for key in ("pool_id", "client_id", "client_secret", "discovery_url")}
 
-    try:
-        # Create User Pool
-        user_pool_response = cognito_client.create_user_pool(
-            PoolName="customersupport-user-pool", Policies={"PasswordPolicy": {"MinimumLength": 8}}
-        )
-        pool_id = user_pool_response["UserPool"]["Id"]
-        # Create App Client
-        app_client_response = cognito_client.create_user_pool_client(
-            UserPoolId=pool_id,
-            ClientName="customersupport-client",
-            GenerateSecret=True,
-            ExplicitAuthFlows=[
-                "ALLOW_USER_PASSWORD_AUTH",
-                "ALLOW_REFRESH_TOKEN_AUTH",
-                "ALLOW_USER_SRP_AUTH",
-            ],
-        )
-        print(app_client_response["UserPoolClient"])
-        client_id = app_client_response["UserPoolClient"]["ClientId"]
-        client_secret = app_client_response["UserPoolClient"]["ClientSecret"]
+    print("No existing Cognito configuration found: creating the user pool...")
+    region = Session().region_name
+    cognito_client = boto3.client("cognito-idp", region_name=region)
 
-        # Create User
-        cognito_client.admin_create_user(
-            UserPoolId=pool_id,
-            Username=username,
-            TemporaryPassword="Temp123!",  # pragma: allowlist secret
-            MessageAction="SUPPRESS",
-        )
+    # User pool and app client (with a secret) allowed to log in with username and password
+    pool_id = cognito_client.create_user_pool(
+        PoolName="customersupport-user-pool", Policies={"PasswordPolicy": {"MinimumLength": 8}}
+    )["UserPool"]["Id"]
+    app_client = cognito_client.create_user_pool_client(
+        UserPoolId=pool_id,
+        ClientName="customersupport-client",
+        GenerateSecret=True,
+        ExplicitAuthFlows=[
+            "ALLOW_USER_PASSWORD_AUTH",
+            "ALLOW_REFRESH_TOKEN_AUTH",
+            "ALLOW_USER_SRP_AUTH",
+        ],
+    )["UserPoolClient"]
 
-        # Set Permanent Password
-        cognito_client.admin_set_user_password(
-            UserPoolId=pool_id,
-            Username=username,
-            Password="MyPassword123!",  # pragma: allowlist secret
-            Permanent=True,
-        )
+    # Test user with a permanent password
+    cognito_client.admin_create_user(
+        UserPoolId=pool_id,
+        Username=COGNITO_TEST_USERNAME,
+        TemporaryPassword="Temp123!",  # pragma: allowlist secret
+        MessageAction="SUPPRESS",
+    )
+    cognito_client.admin_set_user_password(
+        UserPoolId=pool_id,
+        Username=COGNITO_TEST_USERNAME,
+        Password=COGNITO_TEST_PASSWORD,
+        Permanent=True,
+    )
 
-        message = bytes(username + client_id, "utf-8")
-        key = bytes(client_secret, "utf-8")
-        secret_hash = base64.b64encode(hmac.new(key, message, digestmod=hashlib.sha256).digest()).decode()
+    cognito_config = {
+        "pool_id": pool_id,
+        "client_id": app_client["ClientId"],
+        "client_secret": app_client["ClientSecret"],
+        # OIDC discovery document: the authorizers read the issuer and the token signing keys from here
+        "discovery_url": f"https://cognito-idp.{region}.amazonaws.com/{pool_id}/.well-known/openid-configuration",
+    }
+    put_ssm_parameter("/app/customersupport/agentcore/client_id", cognito_config["client_id"])
+    put_ssm_parameter("/app/customersupport/agentcore/pool_id", pool_id)
+    put_ssm_parameter("/app/customersupport/agentcore/cognito_discovery_url", cognito_config["discovery_url"])
+    save_customer_support_secret(json.dumps(cognito_config))
 
-        # Authenticate User and get Access Token
-        auth_response = cognito_client.initiate_auth(
-            ClientId=client_id,
-            AuthFlow="USER_PASSWORD_AUTH",
-            AuthParameters={
-                "USERNAME": username,
-                "PASSWORD": "MyPassword123!",  # pragma: allowlist secret
-                "SECRET_HASH": secret_hash,
-            },
-        )
-        bearer_token = auth_response["AuthenticationResult"]["AccessToken"]
-        discovery_url = f"https://cognito-idp.{region}.amazonaws.com/{pool_id}/.well-known/openid-configuration"
-        # Output the required values
-        print(f"Pool id: {pool_id}")
-        print(f"Discovery URL: {discovery_url}")
-        print(f"Client ID: {client_id}")
-        print(f"Bearer Token: {bearer_token}")
-        # Return values if needed for further processing
-        cognito_config = {
-            "pool_id": pool_id,
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "secret_hash": secret_hash,
-            "bearer_token": bearer_token,
-            "discovery_url": discovery_url,
-        }
-        put_ssm_parameter("/app/customersupport/agentcore/client_id", client_id)
-        put_ssm_parameter("/app/customersupport/agentcore/pool_id", pool_id)
-        put_ssm_parameter("/app/customersupport/agentcore/cognito_discovery_url", discovery_url)
+    print(f"Pool id: {pool_id}")
+    print(f"Client ID: {cognito_config['client_id']}")
+    print(f"Discovery URL: {cognito_config['discovery_url']}")
+    return cognito_config
 
-        save_customer_support_secret(json.dumps(cognito_config))
 
-        return cognito_config
-    except Exception as e:
-        print(f"Error: {e}")
-        return None
+def get_cognito_access_token(cognito_config):
+    """Log the test user in and return a new access token (a JWT valid for 1 hour)."""
+    cognito_client = boto3.client("cognito-idp", region_name=Session().region_name)
+
+    # Required because the app client has a secret: HMAC-SHA256(client_secret, username + client_id)
+    message = bytes(COGNITO_TEST_USERNAME + cognito_config["client_id"], "utf-8")
+    key = bytes(cognito_config["client_secret"], "utf-8")
+    secret_hash = base64.b64encode(hmac.new(key, message, digestmod=hashlib.sha256).digest()).decode()
+
+    auth_response = cognito_client.initiate_auth(
+        ClientId=cognito_config["client_id"],
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={
+            "USERNAME": COGNITO_TEST_USERNAME,
+            "PASSWORD": COGNITO_TEST_PASSWORD,
+            "SECRET_HASH": secret_hash,
+        },
+    )
+    return auth_response["AuthenticationResult"]["AccessToken"]
 
 
 def cleanup_cognito_resources(pool_id):
@@ -342,30 +334,6 @@ def cleanup_cognito_resources(pool_id):
     except Exception as e:
         print(f"Error initializing cleanup: {str(e)}")
         return False
-
-
-def reauthenticate_user(client_id, client_secret):
-    boto_session = Session()
-    region = boto_session.region_name
-    # Initialize Cognito client
-    cognito_client = boto3.client("cognito-idp", region_name=region)
-    # Authenticate User and get Access Token
-
-    message = bytes(username + client_id, "utf-8")
-    key = bytes(client_secret, "utf-8")
-    secret_hash = base64.b64encode(hmac.new(key, message, digestmod=hashlib.sha256).digest()).decode()
-
-    auth_response = cognito_client.initiate_auth(
-        ClientId=client_id,
-        AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={
-            "USERNAME": username,
-            "PASSWORD": "MyPassword123!",  # pragma: allowlist secret
-            "SECRET_HASH": secret_hash,
-        },
-    )
-    bearer_token = auth_response["AuthenticationResult"]["AccessToken"]
-    return bearer_token
 
 
 def create_agentcore_runtime_execution_role():
